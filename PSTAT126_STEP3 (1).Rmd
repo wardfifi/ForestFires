@@ -1,0 +1,434 @@
+---
+title: "Forest Fires"
+subtitle: "PSTAT 126 Project Step 3"
+author: "Sofia Ward, Henry McMahon, Pariya Akhiani, Syed Khaled"
+date: "Northeast Region of Portugal 2-28-2008"
+geometry: margin=0.5in
+output:
+  
+  pdf_document: 
+    latex_engine: xelatex
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+# knit options
+knitr::opts_chunk$set(echo = F,
+                      results = 'markup',
+                      fig.align = 'center',
+                      message = F,
+                      warning = F
+                      )
+
+# packages
+library(tinytex) 
+library(tidyverse)
+library(readr)
+library(skimr)
+library(ggcorrplot)
+library(knitr)
+library(ggplot2)
+library(GGally)
+library(faraway)
+library(tidyverse)
+library(tidymodels)
+library(modelr)
+library(leaps)
+library(tibble)
+library(dplyr)
+```
+
+------------------------------------------------------------------------
+
+#### Introduction
+
+This dataset is part of the UCI Machine Learning Repository. The data can be used to predict the burned area of a forest fire given information about weather conditions and fuel moisture. We are instead using the data to predict ISI, the initial spread index, for reasons which will be explained in our analysis. The data was taken from Montesinho Natural Park in northeastern Portugal in 2007-2008, so the results apply to a forest with similar foliage.
+
+```{r, echo = F, results = "hide"}
+#TRAINING DATA
+
+forestfires <- read_csv("forest+fires/forestfires.csv")
+
+#forestfires %>% pull(month) %>% str()
+
+get_season <- function(month) {
+  if (month %in% c("dec", "jan", "feb")) {
+    return("Winter")
+  } else if (month %in% c("mar", "apr", "may")) {
+    return("Spring")
+  } else if (month %in% c("jun", "jul", "aug")) {
+    return("Summer")
+  } else if (month %in% c("sep", "oct", "nov")) {
+    return("Fall")
+  } else {
+    return(NA)  # Return NA if the month is not recognized
+  }
+}
+
+forestfires$seasons <- sapply(tolower(forestfires$month), get_season)
+forestfires$seasons <- factor(forestfires$seasons, levels = c("Winter", "Spring", "Summer", "Fall"))
+forestfires <- forestfires[ , !(names(forestfires) %in% c("month"))]
+#head(forestfires)
+
+#lm(ISI ~ . ,forestfires)
+
+num_rows <- nrow(forestfires)
+num_subset <- floor(0.3 * num_rows)
+set.seed(25)
+subset_indices <- sample(1:num_rows, num_subset)
+subset_data <- forestfires[subset_indices, ]
+
+subset_data
+
+# quick troubleshooting for seasons factor
+#months <- c("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+#seasons <- sapply(months, get_season)
+#data_matrix <- cbind(Month = months, Season = seasons)
+#invalid_rows <- is.na(data_matrix[, "Season"])
+#invalid_data_matrix <- data_matrix[invalid_rows, ]
+#print(invalid_data_matrix)
+#print(data_matrix)
+
+```
+
+#### Variable Relationships
+
+```{r, results = "hide"}
+#PAIRWISE COMPARION
+
+# relevant columns
+##forestfires$log_area <- log(forestfires$area + 1)  
+selected_columns1 <- forestfires[, c("X", "Y", "FFMC", "DMC", "DC", "ISI", "temp", "RH", "wind", "rain", "area")]
+
+
+# ggpairs plot
+ggp1 <- ggpairs(
+  selected_columns1,
+  columns = 1:11,  # Specify the columns to be plotted
+  upper = list(continuous = wrap("cor", size = 3)),  # Correlation coefficient in the upper triangle
+  lower = list(continuous = "points"),  # Scatter plots in the lower triangle
+  diag = list(continuous = "barDiag"),  # Histograms on the diagonal
+  columnLabels = colnames(selected_columns1)  # Use column names for labels
+)
+
+#  plot title and theme
+ggp1 <- ggp1 +
+  ggtitle("Pairwise Comparison of Explanatory Variables vs. ISI") +
+  theme_bw() +  
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12)
+  )
+
+selected_columns2 <- forestfires[, c("ISI","seasons","day")]
+
+ggp2 <- ggpairs(
+  selected_columns2,
+  columns = 1:3,  # Specify the columns to be plotted
+  upper = list(continuous = wrap("cor", size = 3)),  # Correlation coefficient in the upper triangle
+  lower = list(continuous = "points"),  # Scatter plots in the lower triangle
+  diag = list(continuous = "barDiag"),  # Histograms on the diagonal
+  columnLabels = colnames(selected_columns2)  # Use column names for labels
+)
+
+#  plot title and theme
+ggp2 <- ggp2 +
+  ggtitle("Pairwise Comparison of Explanatory Variables (categoricals) vs. ISI") +
+  theme_bw() +  
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12)
+  )
+
+
+```
+
+We used a *ggpairs()* plot to determine the pairwise relationship between variables. There is a weak correlation between *Area* and the other predictors. There are large outliers in *Area*, and because most of the fires in our dataset have similar *Area*, it is not a good response variable. This is why we will predict *ISI*. Additionally, it is pretty clear that there is a second degree polynomial relationship between *FFMC* and *ISI*
+
+Contextual variable selection is useful in this regard, but criteria based variable seleciton will still be carried out. From our domain knowledge, we know that *DMC*, *FFMC*, and *DC* are combinations of *temperature*, *RH* and *wind*. So, these predictors will need to be left out for meaningful analysis.
+
+### Initial Model Selection
+
+Based on our domain knowledge, we select initial models. We had one model use all of the input terms and the other use the FFMC variable instead:
+
+$$
+\text{Model 1:} \quad \text{ISI} \sim \text{temp } + \text{ RH } + \text{ wind } + \text{ rain } + \text{ seasons } + \text{ day }
+$$
+$$
+\text{Model 2:} \quad \text{ISI} \sim \text{ wind } + \text{ seasons } + \text{ FFMC}^2 + \text{FFMC} + \text{ day }
+$$
+
+```{r, results = "hide"}
+
+mlm3 <- lm(ISI ~ temp + RH + wind + rain + seasons + day, subset_data)
+summary(mlm3)
+mlm4 <- lm(ISI ~ wind + seasons + poly(FFMC,2) + day, subset_data)
+summary(mlm4)
+
+#intercept, temp, RH, wind:seasonsSpring, wind:seasonsSummer, wind:seasonsFall, X:RH:rain, temp:RH:wind, temp:RH:rain
+
+```
+
+We compare the $R^2$ values, obtained from the summary of the *lm()* function used for each model:
+
+```{r}
+r1 = summary(mlm3)$r.squared
+r2 = summary(mlm4)$r.squared
+
+print(paste("Model 1:", r1))
+print(paste("Model 2:", r2))
+```
+
+The $R^2$ value for Model 2 is significantly higher than Model 1, indicating that Model 2 should be selected over Model 1.
+
+### Criterion Based Model Selection
+
+We use stepwise search to find the 'best' model in terms of minimizing *AIC* and *BIC*:
+
+```{r, results = "hide"}
+options(max.print = 10000)  # Set max print size to a larger value
+
+
+#out <- regsubsets(ISI ~ ., data = subset_data, method = 'seqrep', nbest = 1) 
+
+#nrow(forestfires_partition)
+
+excluded_variables <- c("FFMC", "DMC", "DC","day","soilmoisture")
+train_filtered <- subset_data[, !colnames(subset_data) %in% excluded_variables]
+train_filtered  
+
+out <- regsubsets(ISI ~ .^3,
+                  data = train_filtered,
+                method = 'seqrep',
+                  nbest = 10
+)
+
+
+tidy_leaps <- function(out, n_obs) {
+  # Extract summary information
+  summary_out <- summary(out)
+  
+  # Extract the logical matrix indicating which variables are in each model
+  p_matrix <- summary_out$which
+  
+  # Create a list of model terms by extracting the names of selected variables
+  model_terms <- apply(p_matrix, 1, function(x) paste(names(x)[x], collapse = ", "))
+  
+  # Extract the metrics
+  bic <- summary_out$bic
+  adjrsq <- summary_out$adjr2
+  aic <- summary_out$cp  # Note: 'leaps' package does not directly provide AIC, using Cp as a proxy
+  
+  # Create the tibble
+  results <- tibble(
+    p = rowSums(p_matrix), # Number of predictors
+    n = rep(n_obs, nrow(p_matrix)), # Number of observations
+    model_id = 1:nrow(p_matrix),
+    model_terms = model_terms,
+    bic = bic,
+    adjrsq = adjrsq,
+    aic = aic
+  )
+  
+  return(results)
+}
+
+tidy_results <- tidy_leaps(out, n_obs = 129)
+
+best_models <- tidy_leaps(out, n_obs = 129) %>%
+  mutate(adjrsq = -adjrsq) %>%
+  pivot_longer(c('aic', 'bic', 'adjrsq'),
+               names_to = 'criterion',
+               values_to = 'value') %>%
+  group_by(criterion) %>%
+  slice_min(order_by = value, n = 1)
+
+best_models
+top <- as.character(best_models[1,4])
+top
+
+```
+
+```{r}
+top
+```
+
+**TO DO:** Explain what this model means, write it nicely in LATEX.
+
+#### Forward Selection on *Day*
+
+We use forward selection to justify that *day* is not a useful predictor for *ISI*.
+
+**TO DO:** Figure out what model we were supposed to use for lm
+
+```{r, results = "hide"}
+#lm(ISI ~ temp + RH + wind + rain + seasons + day, 
+#               forestfires_partition$test) %>% tidy()
+
+no_day <- lm(ISI ~ temp + RH + wind + rain + seasons, subset_data)
+summary(no_day)
+
+#lm(ISI ~ temp + RH + wind + rain + seasons, 
+#             forestfires_partition$test) %>% tidy()
+with_day <- lm(ISI ~ temp + RH + wind + rain + seasons + day, subset_data)
+summary(with_day)
+
+
+```
+
+The $R^2$ values of the model with and without the predictor *day* are:
+
+```{r}
+noday = summary(no_day)$r.squared
+withday = summary(with_day)$r.squared
+
+print(paste("Without Day:", noday))
+print(paste("With Day:", withday))
+```
+
+These values are very similar, so we can remove *day* from our model. Now, we know that *seasons* should be an interaction variable for *wind*, and *day* is not a useful predictor.
+
+**TO DO:** fix mlm6. The criteria selection best models have very low R\^2.
+
+```{r}
+mlm5 <- lm(ISI ~ temp + RH + wind:seasons + rain, subset_data)
+summary(mlm5)
+ mlm6 <- lm(log(ISI) ~ seasons:wind + poly(FFMC,2), subset_data)
+summary(mlm6)
+#mlm7 <- lm(log(ISI) ~ sqrt(wind) + poly(FFMC,2), subset_data)
+#summary(mlm7)
+```
+
+mlm6 is clearly a better model with a much higher R-squared, all variables are statistically significant and the model as a whole is significant.
+
+#### Residual Checking & Diagnostics
+
+```{r, eval = T}
+
+augmented_data <- augment(mlm6, subset_data)
+residuals <- augmented_data$.resid
+fitted_values <- predict(mlm6)
+
+acceptable <- 3
+outlier <- augmented_data %>%
+  filter(.std.resid > acceptable)
+threshold <- 4 / nrow(augmented_data)
+influential_points <- augmented_data %>%
+  filter(.cooksd > threshold)
+
+long_data <- augmented_data %>%
+  pivot_longer(cols = c(.fitted, FFMC, wind))
+ggplot(long_data, aes(y = .resid, x = value)) +
+  facet_wrap(~ name, scales = 'free_x') +
+  geom_point() +
+  geom_point(data = long_data %>% filter(.cooksd > threshold), color = 'green') +
+  geom_hline(aes(yintercept = 0)) +  geom_point(data = long_data %>% filter(.std.resid > acceptable), color = 'red') + 
+  geom_smooth(method = 'loess', formula = 'y ~ x', se = FALSE, span = 1) 
+
+
+long_data1 <- augmented_data %>%
+  pivot_longer(cols = c(.fitted, wind))
+ggplot(long_data1, aes(y = .resid, x = value, color = seasons)) +
+  facet_wrap(~ name, scales = 'free_x') + geom_hline(aes(yintercept = 0)) +
+  geom_point() + scale_color_manual(values = c("Winter" = "purple", "Spring" = "pink", "Summer" = "red", "Fall" = "magenta"))
+
+ggplot(augmented_data, aes(sample = residuals)) + geom_qq(color = 'black') + geom_qq_line(color = 'red') + labs(title = "Residuals QQ-Plot", caption = "Figure 3: Residuals QQ-Plot") + theme(plot.caption = element_text(hjust = 0.5))
+
+observation_index <- 1:nrow(augmented_data)
+largest_row <- augmented_data %>% filter(.hat == max(.hat))
+
+ggplot(data = augmented_data, aes(x = observation_index, y = .hat)) + geom_point()
+  
+studentize <- function(resid, n, p){
+  resid*sqrt((n - p - 1)/(n - p - resid^2))
+}
+# augment the output of augment
+fit_df <- augment(mlm6, augmented_data) %>%
+  mutate(rownum = row_number(),
+         .ext.std.resid = studentize(.std.resid, n = 155, p = 2))
+ggplot(data = fit_df, aes(x=observation_index, y = .ext.std.resid)) + geom_point()
+```
+
+**TO DO:** Show plots
+
+All of the residuals seem to be fine, but again you are able to see in the data that most of the fires fell within an extremely tight range. A square root transformation had to performed on the response variable, originally the fitted values were displaying non-constant variance through a somewhat pronounced fan pattern. However, there is a pretty clear outlier. Let's explore the fit without that data point.
+
+Now lets look at influence & outlier points.
+
+```{r}
+unusual_idx <- augment(mlm6, subset_data) %>%
+  mutate(idx = row_number()) %>%
+  slice_max(order_by = abs(.resid), n = 1) %>%
+  pull(idx)
+
+# exclude and refit
+mlm6_drop <- lm(log(ISI) ~ seasons:wind + poly(FFMC,2,raw=T), 
+                  data = subset_data[-unusual_idx, ])
+
+subset_data %>%
+  data_grid(wind = seq_range(wind, 50),
+            FFMC = quantile(FFMC, c(0.2, 0.5,0.8)), seasons = levels(seasons)) %>%
+  add_predictions(mlm6, var = 'with_outlier') %>%
+  add_predictions(mlm6_drop, var = 'without_outlier') %>%
+  pivot_longer(cols = c(with_outlier, without_outlier)) %>%
+  ggplot(aes(x = wind, color = FFMC)) +
+  facet_wrap(~ name) +
+  geom_point(aes(y = log(ISI)), data = subset_data) +
+  geom_smooth(aes(y = value, group = FFMC, color = FFMC), method = "lm", se = FALSE) +
+  scale_color_viridis_c(limits = c(85, 95)) +
+  guides(linetype = guide_none())
+  
+unusual_idx1 <- augment(mlm6, subset_data) %>%
+  mutate(idx = row_number()) %>%
+  slice_max(order_by = abs(.hat), n = 10) %>%
+  pull(idx)
+
+# exclude and refit
+mlm6_drop1 <- lm(log(ISI) ~ seasons:wind + poly(FFMC,2,raw=T), 
+                  data = subset_data[-unusual_idx1, ])
+
+subset_data %>%
+  data_grid(wind = seq_range(wind, 50),
+            FFMC = quantile(FFMC, c(0.2, 0.5, 0.8)), seasons = levels(seasons)) %>%
+  add_predictions(mlm6, var = 'with_influences') %>%
+  add_predictions(mlm6_drop1, var = 'without_influences') %>%
+  pivot_longer(cols = c(with_influences, without_influences)) %>%
+  ggplot(aes(x = wind, color = FFMC)) +
+  facet_wrap(~ name) +
+  geom_point(aes(y = log(ISI)), data = subset_data) +
+  geom_smooth(aes(y = value, group = FFMC, color = FFMC), method = "lm", se = FALSE) +
+  scale_color_viridis_c(limits = c(85, 95)) +
+  guides(linetype = guide_none())
+```
+
+### Visualizing the Fit
+
+**to discuss** actually not sure if this is necessary. not in the directions anywhere...
+
+
+```{r}
+pred_df <- data_grid(data = forestfires, wind, .model = mlm6) %>% add_predictions(model=mlm6)
+
+ggplot(pred_df, aes(x = wind, color = FFMC)) + geom_point(data = forestfires, aes(y = log(ISI))) + geom_path(aes(y = pred)) + scale_color_viridis_c(limits = c(85, 95)) 
+
+pred_df1 <- data_grid(data = forestfires, wind = seq_range(wind, 100), FFMC = seq_range(FFMC, 5), .model = mlm6) %>% 
+  add_predictions(model = mlm6)
+
+ggplot(pred_df1, aes(x = wind, color = FFMC)) + geom_point(data = forestfires, aes(y = log(ISI)))  + geom_path(aes(y = pred)) + scale_color_viridis_c(limits = c(85, 95))
+
+#geom_path(data = pred_df1, aes(x = wind, y = pred), size = 1, alpha = 0.7) + # Adjust path size and transparency
+ # geom_smooth(data = pred_df1, aes(x = wind, y = pred), method = "loess", se = FALSE, color = "blue") + # Add smoo
+```
+
+gives estimated relationship when FFMC is at its median value
+# needs CI & PI added i think...
+
+
+
+**TO DO:** Show plots with PI and CI
+
+### Summary:
+
+**TO DO:** Add summary

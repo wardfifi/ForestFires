@@ -1,0 +1,278 @@
+---
+title: "Forest Fires"
+subtitle: "PSTAT 126 Project Step 4"
+author: "Pariya Akhiani, Syed Khaled, Henry McMahon, Sofia Ward"
+date: "Northeast Region of Portugal 2-28-2008"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(kableExtra)
+library(faraway)
+library(glmnet)
+library(splines)
+library(glmnet)
+library(mgcv)
+library(pls)
+library(sandwich)  # for robust standard errors
+library(lmtest)  
+library(psych)
+library(tinytex) 
+library(tidyverse)
+library(readr)
+library(skimr)
+library(ggcorrplot)
+library(knitr)
+library(ggplot2)
+library(GGally)
+library(faraway)
+library(tidymodels)
+library(modelr)
+library(leaps)
+library(tibble)
+library(dplyr)
+library(MASS)
+
+```
+
+#### Introduction
+
+This dataset is part of the UCI Machine Learning Repository. The data can be used to predict the burned area of a forest fire given information about weather conditions and fuel moisture.
+
+The data was taken from Montesinho Natural Park in northeastern Portugal in 2007-2008.
+
+#### Variable Content
+
+Variables 5-9 are taken from the Canadian Forest Fire Weather Index (FWI) System, which aim to measure the effects of fuel moisture on forest fires. Here, the forest type is a generalized pine forest, so the fuel is pine needles and bark.
+
+
+1.  **x-axis :** x-coordinate with respect to the Montesinho Park Map: 1 to 9
+2.  **y-axis :** y-coordinate with respect to the Montesinho Park Map: 2 to 9
+3.  **Month :** categorical data type representing the month: 'jan' to 'dec'
+4.  **Day :** categorical data type representing the day of the week: 'mon' to 'sun'
+5.  **FFMC :** Fine Fuel Moisture Code index (from the FWI system): 18.7 to 96.20
+    -   continuous numerical value representing the fine fuel moisture of fuels 1-2cm deep from the ground (surface layer)
+    -   It expresses the ease of ignition and fuel flammability.
+    -   FFMC is sensitive to daily changes in temperature, rainfall, relative humidity, and wind speed. The time lag is 2/3 day, so it takes approximately 16 hours for changes in weather to affect the fine fuel. Higher fine fuel value is representative of more flammable fuel present in the surface layer.
+6.  **DMC :** Duff Moisture Code index (from the FWI system): 1.1 to 291.3
+    -   continuous numerical value representing the fuel moisture of decomposed organic material underneath the fine fuel, 5-10 cm deep. A higher value corresponds to less moisture present.
+    -   The time lag of weather impacting DMC is 12 days
+7.  **DC :** Drought Code index (from the FWI system): 7.9 to 860.6
+    -   continuous numerical value representing the moisture of compacted organic material 10-20 cm deep
+    -   indicates seasonal drought effects and smoldering in deep layers
+    -   The time lag of weather impacting DC is 52 days
+    -   Higher DC signifies drought conditions
+8.  **ISI :** Inital Spread Index (from the FWI system): 0.0 to 56.10
+    -   continuous numeric rating of initial fire spread, which does not depend on fuel, but rather wind speed and time of day. Higher ISI is associated with fire risk.
+9.  **Temp :** temperature in Celsius: 2.2 to 33.30
+10. **RH :** relative humidity (percentage): 15.0 to 100
+11. **Wind :** wind speed in km/h: 0.40 to 9.40
+12. **Area :** the burned area of the forest (in ha): 0.00 to 1090.84
+    -   this output variable is very skewed towards 0.0, thus it may make sense to model with the logarithm transform.
+
+```{r, echo=FALSE}
+forestfires <- read_csv("forest+fires/forestfires.csv")
+# variable set up
+
+forestfires_onehot <- model.matrix(~.-1, data = forestfires)  # Remove the intercept to avoid the dummy variable trap
+
+forestfires_numeric <- forestfires[, sapply(forestfires, is.numeric)]
+forestfires_scaled <- scale(forestfires_onehot, center = TRUE, scale = FALSE)
+forestfires_scaled <- as.data.frame(forestfires_scaled)
+
+
+forestfires <- forestfires %>%
+  mutate(log_FFMC = log(FFMC))
+forestfires <- forestfires %>% 
+  mutate(log_ISI = log(ISI+1))
+
+get_season <- function(month) {
+  if (month %in% c("dec", "jan", "feb")) {
+    return("Winter")
+  } else if (month %in% c("mar", "apr", "may")) {
+    return("Spring")
+  } else if (month %in% c("jun", "jul", "aug")) {
+    return("Summer")
+  } else if (month %in% c("sep", "oct", "nov")) {
+    return("Fall")
+  } else {
+    return(NA)  # Return NA if the month is not recognized
+  }
+}
+
+
+forestfires$seasons <- sapply(tolower(forestfires$month), get_season)
+forestfires$seasons <- factor(forestfires$seasons, levels = c("Winter", "Spring", "Summer", "Fall"))
+forestfires <- forestfires[ , !(names(forestfires) %in% c("month"))]
+
+forestfires <- forestfires %>%
+  mutate(log_FFMC = log(FFMC))
+forestfires <- forestfires %>% 
+  mutate(log_ISI = log(ISI+1))
+
+model <- lm(log_ISI ~  .-ISI, forestfires)
+summary(model)
+
+df_corr <- as.data.frame(round(cor(forestfires_numeric),2))
+
+# Create a function to bold values greater than 0.50
+bold_high_cor <- function(x) {
+  ifelse(abs(x) > 0.50, paste0('**', x, '**'), x)
+}
+
+# Apply the function to the entire data frame
+df_corr[] <- lapply(df_corr, bold_high_cor)
+
+# Print the correlation matrix with formatting using kable
+kable(df_corr, format = "html", escape = FALSE) %>%
+  kable_styling()
+
+x <- model.matrix(model)[,-1]
+vif(x)
+
+```
+
+These results make a lot of sense due to that massive outlier that we had, heavily inflating area. seasons summer and fall having such a high variance inflation value was somewhat suprising, but log(FFMC) having a high VIF was also not very surprising because there was a lot of variation in the lower values there as well.
+
+
+## Ridge Regression
+
+
+```{r, echo=FALSE}
+forestfiresdata <- data.frame(forestfires[, !(names(forestfires) %in% c("log_ISI", "ISI"))])
+
+y <- forestfires$log_ISI  # Assuming 'log_ISI' is the log of ISI
+x <- model.matrix(~., data = forestfiresdata)[,-1]  # Remove the intercept column create
+
+# Scale the data
+x <- scale(x, center = TRUE, scale = TRUE)
+
+# Perform cross-validated lasso regression (alpha = 1)
+cv_model <- cv.glmnet(x, y, alpha = 0)
+best_lambda <- cv_model$lambda.min
+cat("Best lambda:", best_lambda, "\n")
+
+# Plot the cross-validation curve
+plot(cv_model, cex=0.8)
+
+# Fit the final model using the best lambda
+best_model <- glmnet(x, y, alpha = 0, lambda = best_lambda)
+cat("Coefficients of the best model:\n")
+print(coef(best_model))
+```
+
+
+## Lasso Regression
+
+
+```{r, echo=FALSE}
+forestfiresdata <- data.frame(forestfiresdata[, !(names(forestfiresdata) %in% c("log_ISI", "ISI"))])
+y <- forestfires$log_ISI  # Assuming 'log_ISI' is the log of ISI
+x <- model.matrix(~., data = forestfiresdata)[,-1]  # Remove the intercept column create
+
+# Scale the data
+x <- scale(x, center = TRUE, scale = TRUE)
+
+# Perform cross-validated lasso regression (alpha = 1)
+cv_model <- cv.glmnet(x, y, alpha = 1)
+best_lambda <- cv_model$lambda.min
+cat("Best lambda:", best_lambda, "\n")
+
+# Plot the cross-validation curve
+plot(cv_model, cex=0.8)
+
+# Fit the final model using the best lambda
+best_model <- glmnet(x, y, alpha = 1, lambda = best_lambda)
+cat("Coefficients of the best model:\n")
+print(coef(best_model))
+```
+
+
+
+```{r,echo=F}
+# Fit the linear model (MLR)
+MLR <- lm(log_ISI ~ seasons:wind + poly(log_FFMC, 2), data = forestfires)
+
+# Generate predictions from the MLR model
+pred_MLR <- predict(MLR, newdata = forestfires)
+
+# Prepare data for Ridge and Lasso regression
+# Assuming x and y are already defined
+# Check for missing values and remove them
+forestfiresdata <- data.frame(forestfires[, !(names(forestfires) %in% c("log_ISI", "ISI"))])
+y <- forestfires$log_ISI  # Assuming 'log_ISI' is the log of ISI
+x <- model.matrix(~., data = forestfires)[,-1]  # Remove the intercept column create
+complete_cases <- complete.cases(x, y)
+x <- x[complete_cases, ]
+y <- y[complete_cases]
+
+# Fit Ridge regression with cross-validation to find the best lambda
+cv_ridge <- cv.glmnet(x, y, alpha = 0)
+best_lambda_ridge <- cv_ridge$lambda.min
+ridge_model <- glmnet(x, y, alpha = 0, lambda = best_lambda_ridge)
+pred_ridge <- predict(ridge_model, s = best_lambda_ridge, newx = x)
+
+# Fit Lasso regression with cross-validation to find the best lambda
+cv_lasso <- cv.glmnet(x, y, alpha = 1)
+best_lambda_lasso <- cv_lasso$lambda.min
+lasso_model <- glmnet(x, y, alpha = 1, lambda = best_lambda_lasso)
+pred_lasso <- predict(lasso_model, s = best_lambda_lasso, newx = x)
+
+# Prepare a data frame for plotting
+plot_data <- data.frame(
+  observed = forestfires$log_ISI,
+  predicted_MLR = pred_MLR,
+  predicted_ridge = as.vector(pred_ridge),
+  predicted_lasso = as.vector(pred_lasso)
+)
+
+# Plot the observed vs. predicted values
+ggplot(plot_data, aes(x = observed)) +
+  geom_point(aes(y = predicted_MLR, color = "MLR")) +
+  geom_point(aes(y = predicted_ridge, color = "Ridge")) +
+  geom_point(aes(y = predicted_lasso, color = "Lasso")) +
+  labs(x = "Observed log_ISI", y = "Predicted log_ISI", color = "Model", title = "Model Types (Predicted vs. Observed)") +
+  theme_minimal() +
+  scale_color_manual(values = c("MLR" = "blue", "Ridge" = "red", "Lasso" = "green"))
+```
+
+Overall, the models performed well, with Ridge and Lasso offering valuable insights into the data's underlying structure, while MLR provided a useful baseline. Further exploration into variable interactions and model tuning is recommended to refine predictions and enhance model accuracy.
+
+
+## FACTOR ANALYSIS
+Factor analysis can be highly beneficial for a dataset particularly when it comes to dimensional reduction, and understanding underlying relationships. Reducing the number of dimensions to two or three factors can allow for meaningful visualizations, making it easier to identify patterns, clusters, and outliers in the data.
+
+```{r, echo=FALSE}
+factor_data <- forestfires[, c("temp", "RH", "wind", "area", "rain")]
+minimized_factor_data <- forestfires[, c("temp", "wind", "FFMC")]
+#USING TEMP FOR NUMERICAL
+
+factor_data <- na.omit(factor_data)
+minimized_factor_data <- na.omit(minimized_factor_data)
+
+factor_model1 <- principal(factor_data, nfactors = 2, rotate = "varimax")
+
+print(factor_model1)
+
+factor_model2 <- principal(minimized_factor_data, nfactors = 2, rotate = "varimax")
+
+print(factor_model2)
+
+
+```
+Output 1: Demonstrates some very strong correlations (-0.87 for 'temp' and 0.81 for 'RH'), but Fit based upon off diagonal values is a low 0.04. 
+Output 2: A fit value of 0.67 suggests that the model is reasonably good at explaining the patterns of correlations, accounting for approximately 67% of the variance in the off-diagonal elements of the correlation matrix.Output 2 Shows very strong correlations for the included variables, such as 0.97 for 'wind' with 'u2' and 0.88 for 'FFMC' with 'u2'.
+
+In the context of fire weather modeling or analysis, variables like 'wind' and 'FFMC' are crucial factors that influence fire behavior and fire danger assessments.
+
+Considering high collinearity, Output 2 with less parameters is better because it focuses on variables ('wind' and 'FFMC') that have strong individual correlations with the factors of interest ('u2' and 'com'). This reduces the complexity of interpreting relationships and potentially improves the accuracy and reliability of modeling and prediction efforts, especially in contexts where understanding the direct impacts of specific variables is critical.
+
+
+Conditions are vital to ensure the validity and reliability of the results:
+- linearity 
+- adequate sample size: 5-10 variables, the sample size of 280 is adequate
+- no perfect multicolinearity
+
+No obvious violations of conditions for Factor Analysis
+
